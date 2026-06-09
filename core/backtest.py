@@ -2,46 +2,32 @@
 # ROLE: Walk-forward validation harness
 #
 # VALIDATED BASELINE: RS Extension (OOS Sharpe 0.96, CAGR 26.2%, MaxDD -12.7%)
-# This is the system that won the StratFlow head-to-head. It is the benchmark
-# every new filter or variant must beat before being promoted to live use.
 #
 # WALK-FORWARD STRUCTURE:
-#   - IS  (In-Sample):  First 70% of data — parameter fitting
-#   - OOS (Out-of-Sample): Last 30% — honest performance measurement
-#   - WFE (Walk-Forward Efficiency): OOS Sharpe / IS Sharpe
-#     WFE > 0.70 = excellent (minimal overfitting)
-#     WFE > 0.50 = acceptable
-#     WFE < 0.50 = likely overfit — do not promote
-#
-# SIGNALS AVAILABLE:
-#   1. rs_extension   — validated baseline (RS momentum + extension filter)
-#   2. rs_trend       — RS Extension + trend/deterioration filter
-#   3. vsa_confirm    — RS Extension + VSA confirmation layer (new)
-#   4. flow_confirm   — RS Extension + flow score threshold (new)
-#   5. combined       — RS + VSA + flow together
-#
-# Each signal returns a daily position series (+1 long, 0 flat).
-# Performance metrics calculated on that series vs buy-and-hold SPY.
+#   IS  (In-Sample):  First 70% of data
+#   OOS (Out-of-Sample): Last 30% — the only metrics that matter
+#   WFE (Walk-Forward Efficiency): OOS Sharpe / IS Sharpe
+#     >= 0.70 excellent  |  >= 0.50 acceptable  |  < 0.50 likely overfit
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import yfinance as yf
 
 import config as cfg
-from core.data import get_close_batch
 
 
 # ==============================================================================
-# RESULT DATACLASS
+# RESULT CLASS
 # ==============================================================================
 class BacktestResult:
     def __init__(
         self,
         name:       str,
-        equity:     pd.Series,     # daily portfolio value
-        positions:  pd.Series,     # +1 / 0
-        returns:    pd.Series,     # daily returns
+        equity:     pd.Series,
+        positions:  pd.Series,
+        returns:    pd.Series,
         is_sharpe:  float,
         oos_sharpe: float,
         is_cagr:    float,
@@ -81,43 +67,94 @@ class BacktestResult:
 
 
 # ==============================================================================
-# MAIN: Run a named strategy
+# DATA FETCH — direct yfinance, bypasses cache layer issues
+# ==============================================================================
+def _fetch_closes(tickers: list[str], period: str) -> pd.DataFrame:
+    """
+    Fetches daily closes for a list of tickers directly via yfinance.
+    Returns a clean wide DataFrame (Date index, tickers as columns).
+    Falls back to Stooq for any missing tickers.
+    """
+    try:
+        raw = yf.download(
+            tickers,
+            period=period,
+            interval="1d",
+            progress=False,
+            auto_adjust=True,
+            threads=True,
+        )
+        if raw.empty:
+            return pd.DataFrame()
+
+        # Extract Close — handle both single and multi-ticker
+        if isinstance(raw.columns, pd.MultiIndex):
+            if "Close" in raw.columns.get_level_values(0):
+                closes = raw["Close"]
+            else:
+                closes = raw.xs("Close", level=0, axis=1)
+        else:
+            # Single ticker — raw IS the close data
+            closes = raw[["Close"]] if "Close" in raw.columns else raw
+            if len(tickers) == 1:
+                closes.columns = [tickers[0]]
+
+        closes = closes.ffill().dropna(how="all")
+
+        # If some tickers missing, try Stooq for them
+        missing = [t for t in tickers if t not in closes.columns]
+        for t in missing:
+            df = _stooq_close(t, period)
+            if df is not None:
+                closes[t] = df
+
+        return closes.dropna(how="all")
+
+    except Exception as e:
+        return pd.DataFrame()
+
+
+def _stooq_close(ticker: str, period: str) -> pd.Series | None:
+    """Stooq fallback for a single ticker."""
+    import requests, io
+    period_days = {
+        "1y": 365, "2y": 730, "3y": 1095, "5y": 1825, "7y": 2555
+    }.get(period, 1825)
+    try:
+        url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
+        r   = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r.raise_for_status()
+        df  = pd.read_csv(io.StringIO(r.text), parse_dates=["Date"], index_col="Date")
+        df.columns = [c.strip().title() for c in df.columns]
+        if "Close" not in df.columns:
+            return None
+        return df["Close"].sort_index().iloc[-period_days:]
+    except Exception:
+        return None
+
+
+# ==============================================================================
+# MAIN BACKTEST
 # ==============================================================================
 def run_backtest(
-    strategy:   str   = "rs_extension",
-    universe:   list  | None = None,
-    benchmark:  str   = "SPY",
-    period:     str   = "5y",
-    top_n:      int   = 5,
-    rs_window:  int   = 90,
-    ext_thresh: float = 0.05,
-    trend_ok:   bool  = False,
-    vsa_thresh: float = 0.0,
-    flow_thresh: float= 0.0,
+    strategy:    str         = "rs_extension",
+    universe:    list | None = None,
+    benchmark:   str         = "SPY",
+    period:      str         = "5y",
+    top_n:       int         = 5,
+    rs_window:   int         = 90,
+    ext_thresh:  float       = 0.05,
+    trend_ok:    bool        = False,
+    vsa_thresh:  float       = 0.0,
+    flow_thresh: float       = 0.0,
 ) -> BacktestResult | None:
-    """
-    Runs walk-forward backtest for a given strategy variant.
 
-    Parameters
-    ----------
-    strategy    : one of rs_extension | rs_trend | vsa_confirm | flow_confirm | combined
-    universe    : list of tickers (defaults to all sector ETFs)
-    benchmark   : benchmark ticker for RS calculation
-    period      : data period string
-    top_n       : number of top-RS tickers to hold
-    rs_window   : RS momentum lookback (days)
-    ext_thresh  : RS extension threshold (rs_extension signal)
-    trend_ok    : require causal trend filter (rs_trend signal)
-    vsa_thresh  : min VSA score to confirm (vsa_confirm signal, placeholder)
-    flow_thresh : min flow score to confirm (flow_confirm, placeholder)
-    """
     if universe is None:
         universe = list(cfg.SECTOR_MAP.values())
 
     all_tickers = list(set(universe + [benchmark]))
 
-    # Fetch closes
-    closes = get_close_batch(all_tickers, period=period)
+    closes = _fetch_closes(all_tickers, period)
     if closes.empty or benchmark not in closes.columns:
         return None
 
@@ -128,76 +165,74 @@ def run_backtest(
 
     prices = closes[assets].copy()
 
-    # ----------------------------------------------------------------
-    # SIGNAL: RS Extension (validated baseline)
-    # ----------------------------------------------------------------
-    def _rs_momentum(prices: pd.DataFrame, bench: pd.Series, window: int) -> pd.DataFrame:
-        """
-        RS momentum = current (price/bench) / rolling mean (price/bench)
-        Values > 1.0 indicate the asset is extending above its RS trend.
-        """
-        rs_mat = pd.DataFrame(index=prices.index)
-        for t in prices.columns:
-            rs = prices[t] / bench
-            rs_ma = rs.rolling(window).mean()
-            rs_mat[t] = rs / rs_ma
-        return rs_mat
+    # ------------------------------------------------------------------
+    # RS MOMENTUM MATRIX
+    # rs_ratio[t] = (price[t] / bench) / rolling_mean(price[t] / bench)
+    # Values > 1.0 = extending above RS trend
+    # ------------------------------------------------------------------
+    rs_mat = pd.DataFrame(index=prices.index, columns=assets, dtype=float)
+    for t in assets:
+        rs    = prices[t] / bench
+        rs_ma = rs.rolling(rs_window).mean()
+        rs_mat[t] = rs / rs_ma.replace(0, np.nan)
 
-    def _trend_ok_causal(prices: pd.DataFrame, window: int = 50) -> pd.DataFrame:
-        """
-        Causal trend filter: price > SMA(window) on the PREVIOUS bar.
-        No lookahead: we check yesterday's SMA before placing today's trade.
-        """
-        sma = prices.rolling(window).mean()
-        above = (prices > sma).shift(1).fillna(False)
-        return above
+    # ------------------------------------------------------------------
+    # TREND FILTER (causal — uses previous bar's SMA)
+    # ------------------------------------------------------------------
+    trend_mat = None
+    if trend_ok:
+        sma50     = prices.rolling(50).mean()
+        trend_mat = (prices > sma50).shift(1).fillna(False)
 
-    rs_mat   = _rs_momentum(prices, bench, rs_window)
-    trend_mat = _trend_ok_causal(prices) if trend_ok else None
-
-    # ----------------------------------------------------------------
-    # DAILY POSITIONS
-    # ----------------------------------------------------------------
-    positions = pd.DataFrame(0.0, index=prices.index, columns=assets)
+    # ------------------------------------------------------------------
+    # BUILD POSITION MATRIX
+    # Key fix: use .loc with label-based indexing, not chained .iloc
+    # ------------------------------------------------------------------
+    pos_arr = np.zeros((len(prices), len(assets)), dtype=float)
+    idx_map = {t: i for i, t in enumerate(assets)}
+    dates   = prices.index
 
     for i in range(rs_window + 1, len(prices)):
-        today_rs = rs_mat.iloc[i - 1]   # yesterday's RS (causal)
+        row_rs = rs_mat.iloc[i - 1]        # yesterday's RS (causal)
 
-        # Extension filter: only hold if RS > 1 + ext_thresh
-        eligible = today_rs[today_rs > (1.0 + ext_thresh)].index.tolist()
+        # Extension filter
+        eligible = [t for t in assets
+                    if pd.notna(row_rs[t]) and row_rs[t] > (1.0 + ext_thresh)]
 
         # Trend filter
         if trend_ok and trend_mat is not None:
-            trend_row = trend_mat.iloc[i - 1]
-            eligible  = [t for t in eligible if trend_row.get(t, False)]
+            row_tr   = trend_mat.iloc[i - 1]
+            eligible = [t for t in eligible if bool(row_tr[t])]
 
         if not eligible:
             continue
 
-        # Rank by RS momentum, take top N
-        ranked = today_rs[eligible].sort_values(ascending=False).head(top_n)
-        weight = 1.0 / len(ranked)
-        for t in ranked.index:
-            positions.iloc[i][t] = weight
+        # Rank by RS, take top N, equal weight
+        ranked = sorted(eligible, key=lambda t: row_rs[t], reverse=True)[:top_n]
+        w      = 1.0 / len(ranked)
+        for t in ranked:
+            pos_arr[i, idx_map[t]] = w
 
-    # ----------------------------------------------------------------
+    positions = pd.DataFrame(pos_arr, index=dates, columns=assets)
+
+    # ------------------------------------------------------------------
     # PORTFOLIO RETURNS
-    # ----------------------------------------------------------------
-    asset_rets  = prices.pct_change().fillna(0)
-    port_rets   = (positions.shift(1).fillna(0) * asset_rets).sum(axis=1)
-    equity      = (1 + port_rets).cumprod() * 10_000
-    total_pos   = positions.sum(axis=1)
+    # positions are set on day i, returns are earned on day i+1
+    # shift(1) ensures no lookahead
+    # ------------------------------------------------------------------
+    asset_rets = prices.pct_change().fillna(0)
+    port_rets  = (positions.shift(1).fillna(0) * asset_rets).sum(axis=1)
+    equity     = (1 + port_rets).cumprod() * 10_000
+    total_pos  = positions.sum(axis=1)
 
-    # Count trades (position changes)
     trade_count = int((positions.diff().abs().sum(axis=1) > 0).sum())
 
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------------
     # IS / OOS SPLIT
-    # ----------------------------------------------------------------
-    split_idx = int(len(port_rets) * 0.70)
-
-    is_rets   = port_rets.iloc[:split_idx]
-    oos_rets  = port_rets.iloc[split_idx:]
+    # ------------------------------------------------------------------
+    split_idx  = int(len(port_rets) * 0.70)
+    is_rets    = port_rets.iloc[:split_idx]
+    oos_rets   = port_rets.iloc[split_idx:]
 
     is_sharpe  = _sharpe(is_rets)
     oos_sharpe = _sharpe(oos_rets)
@@ -225,11 +260,11 @@ def run_backtest(
 
 
 # ==============================================================================
-# BENCHMARK: Buy-and-hold SPY
+# BENCHMARK
 # ==============================================================================
 def run_benchmark(period: str = "5y") -> BacktestResult | None:
-    closes = get_close_batch(["SPY"], period=period)
-    if closes.empty:
+    closes = _fetch_closes(["SPY"], period)
+    if closes.empty or "SPY" not in closes.columns:
         return None
 
     rets   = closes["SPY"].pct_change().fillna(0)
@@ -257,40 +292,42 @@ def run_benchmark(period: str = "5y") -> BacktestResult | None:
 # METRICS
 # ==============================================================================
 def _sharpe(rets: pd.Series, rf_daily: float = cfg.RISK_FREE_RATE / 252) -> float:
-    if rets.empty or rets.std() == 0:
+    rets = rets.dropna()
+    if len(rets) < 20 or rets.std() == 0:
         return 0.0
     excess = rets - rf_daily
     return float(excess.mean() / excess.std() * np.sqrt(252))
 
 
 def _cagr(rets: pd.Series) -> float:
-    if rets.empty:
+    rets = rets.dropna()
+    if len(rets) < 20:
         return 0.0
     n_years = len(rets) / 252
-    if n_years <= 0:
+    total   = float((1 + rets).prod())
+    if total <= 0:
         return 0.0
-    total = (1 + rets).prod()
     return float((total ** (1 / n_years) - 1) * 100)
 
 
 def _maxdd(rets: pd.Series) -> float:
+    rets = rets.dropna()
     if rets.empty:
         return 0.0
-    equity  = (1 + rets).cumprod()
-    peak    = equity.cummax()
-    dd      = (equity - peak) / peak
+    equity = (1 + rets).cumprod()
+    dd     = (equity - equity.cummax()) / equity.cummax()
     return float(dd.min() * 100)
 
 
 def _strategy_label(strategy: str, trend_ok: bool, ext_thresh: float) -> str:
-    base = {
-        "rs_extension":  f"RS Extension (ext>{ext_thresh:.2f})",
-        "rs_trend":      f"RS + Trend Filter (ext>{ext_thresh:.2f})",
-        "vsa_confirm":   f"RS + VSA Confirm (ext>{ext_thresh:.2f})",
-        "flow_confirm":  f"RS + Flow Confirm (ext>{ext_thresh:.2f})",
-        "combined":      f"RS + VSA + Flow (ext>{ext_thresh:.2f})",
-    }.get(strategy, strategy)
+    labels = {
+        "rs_extension": f"RS Extension (ext>{ext_thresh:.2f})",
+        "rs_trend":     f"RS + Trend Filter (ext>{ext_thresh:.2f})",
+        "vsa_confirm":  f"RS + VSA Confirm (ext>{ext_thresh:.2f})",
+        "flow_confirm": f"RS + Flow Confirm (ext>{ext_thresh:.2f})",
+        "combined":     f"RS + VSA + Flow (ext>{ext_thresh:.2f})",
+    }
+    base = labels.get(strategy, strategy)
     if trend_ok and "Trend" not in base:
         base += " + Trend"
     return base
-
